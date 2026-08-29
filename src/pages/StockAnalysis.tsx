@@ -63,7 +63,6 @@ import { AITradingBrainCard } from "../components/stock/AITradingBrainCard";
 import { FnOptionsBreakoutCard } from "../components/stock/FnOptionsBreakoutCard";
 import { DeltaAutoTraderCard } from "../components/stock/DeltaAutoTraderCard";
 import { brokerTickEngine } from "../../lib/brokerTickEngine";
-import { useAuth } from "../context/AuthContext";
 
 const QUICK_TICKERS = [
   { symbol: "NIFTY50", name: "🇮🇳 NIFTY 50" },
@@ -149,7 +148,6 @@ export const StockAnalysis: React.FC = () => {
   const [searchInput, setSearchInput] = useState(currentTicker);
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
-  const { user, logout, activeDevicesCount } = useAuth();
 
   // Loading & 30-Second Timer States
   const [loading, setLoading] = useState(true);
@@ -622,24 +620,15 @@ export const StockAnalysis: React.FC = () => {
               )}
             </div>
 
-            {/* Authenticated User & Multi-Device Sync Badge */}
+            {/* Terminal Live Status Badge */}
             <div className="flex items-center gap-1.5 shrink-0">
-              <div className="hidden sm:flex items-center gap-2 bg-slate-900/90 border border-slate-800 px-3 py-1.5 rounded-xl">
+              <div className="flex items-center gap-2 bg-slate-900/90 border border-slate-800 px-3 py-1.5 rounded-xl">
                 <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 <div className="text-[11px]">
-                  <span className="font-bold text-white font-mono">{user?.username || "admin"}</span>
-                  <span className="text-slate-400 ml-1.5 text-[10px]">({activeDevicesCount} Synced)</span>
+                  <span className="font-bold text-white font-mono">LIVE TERMINAL</span>
+                  <span className="text-emerald-400 ml-1.5 text-[10px] font-semibold">Active</span>
                 </div>
               </div>
-
-              <button
-                onClick={() => logout()}
-                title="Logout Terminal Session"
-                className="text-xs px-2.5 py-2 rounded-xl bg-slate-900 hover:bg-red-500/20 text-slate-400 hover:text-red-300 border border-slate-800 hover:border-red-500/30 transition flex items-center gap-1"
-              >
-                <Lock className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Exit</span>
-              </button>
             </div>
           </div>
         </div>
