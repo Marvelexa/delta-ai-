@@ -486,6 +486,7 @@ export class DeltaAutoTraderEngine {
     this.consecutiveLossCount = 0;
     this.tradesTakenTodayCount = 0;
     this.lastLossTimestamp = 0;
+    this.settings.currentCapitalUSD = this.settings.initialCapitalUSD || DEFAULT_CAPITAL_USD;
     this.inspectionStartTimeMs = Date.now();
     this.inspectionAccumulatedMs = 0;
     this.inspectionPausedAtMs = 0;
