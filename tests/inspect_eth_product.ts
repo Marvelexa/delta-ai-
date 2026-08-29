@@ -5,15 +5,17 @@ import { deltaExchangeEngine } from "../lib/deltaExchangeEngine";
 
 async function main() {
   await deltaExchangeEngine.fetchProducts();
-  const eth = (deltaExchangeEngine as any).products.get("ETHUSD");
-  console.log("ETHUSD Product on Delta Exchange:", {
-    id: eth?.id,
-    symbol: eth?.symbol,
-    contract_value: eth?.contract_value,
-    tick_size: eth?.tick_size,
-    initial_margin: eth?.initial_margin,
-    default_leverage: eth?.default_leverage
-  });
+  for (const sym of ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "DOGEUSD"]) {
+    const p = (deltaExchangeEngine as any).products.get(sym);
+    console.log(sym, {
+      id: p?.id,
+      symbol: p?.symbol,
+      contract_value: p?.contract_value,
+      contract_unit_currency: p?.contract_unit_currency,
+      tick_size: p?.tick_size,
+      initial_margin: p?.initial_margin
+    });
+  }
 }
 
 main().catch(console.error);

@@ -333,12 +333,16 @@ export const StockAnalysis: React.FC = () => {
       let loadedRec: StockRecommendation | null = null;
       let loadedHistory: OHLCVBar[] = [];
 
-      // 1. Attempt Backend API fetch first
+      // 1. Attempt Backend API fetch first with strict 3-second timeout
       try {
         const cacheBuster = Date.now();
         const [recRes, histRes] = await Promise.all([
-          fetch(`/api/stock/${encodeURIComponent(tickerSymbol)}/recommendation?force=true&category=${category}&t=${cacheBuster}`),
-          fetch(`/api/stock/${encodeURIComponent(tickerSymbol)}/price-history?days=90&t=${cacheBuster}`)
+          fetch(`/api/stock/${encodeURIComponent(tickerSymbol)}/recommendation?force=true&category=${category}&t=${cacheBuster}`, {
+            signal: AbortSignal.timeout(3000)
+          }),
+          fetch(`/api/stock/${encodeURIComponent(tickerSymbol)}/price-history?days=90&t=${cacheBuster}`, {
+            signal: AbortSignal.timeout(3000)
+          })
         ]);
 
         if (recRes.ok) {
@@ -367,11 +371,17 @@ export const StockAnalysis: React.FC = () => {
       // 2. Client-Side Resilience Engine: If Backend API returned non-JSON / 404 on Vercel, run directly in browser!
       if (!loadedRec) {
         console.log(`[StockAnalysis] 🧠 Running client-side analysis engine for ${tickerSymbol}...`);
-        loadedRec = await stockResearchEngine.analyzeStock(tickerSymbol, true, category);
+        loadedRec = await Promise.race([
+          stockResearchEngine.analyzeStock(tickerSymbol, true, category),
+          new Promise<null>(resolve => setTimeout(() => resolve(null), 4000))
+        ]);
+        if (!loadedRec) {
+          loadedRec = await stockResearchEngine.analyzeStock(tickerSymbol, false, category);
+        }
       }
 
       if (!loadedHistory || loadedHistory.length === 0) {
-        const histResult = await stockResearchEngine.fetchRealOHLCV(tickerSymbol, 90);
+        const histResult = await stockResearchEngine.fetchRealOHLCV(tickerSymbol, 90).catch(() => null);
         if (histResult?.bars && histResult.bars.length > 0) {
           loadedHistory = histResult.bars;
         } else {

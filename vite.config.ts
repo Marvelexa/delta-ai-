@@ -18,15 +18,15 @@ export default defineConfig(() => {
       exclude: ['playwright', 'playwright-core', 'events']
     },
     server: {
-      port: 3000,
+      port: 3001,
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:3001',
+          target: 'http://127.0.0.1:3002',
           changeOrigin: true,
           secure: false,
         },
         '/ws': {
-          target: 'ws://127.0.0.1:3001',
+          target: 'ws://127.0.0.1:3002',
           ws: true,
         },
       },
@@ -36,12 +36,17 @@ export default defineConfig(() => {
       },
       watch: process.env.DISABLE_HMR === 'true' ? null : {
         ignored: [
-          '**/public/temp-websites/**',
-          '**/public/videos/**',
-          '**/public/screenshots/**',
+          '**/.delta_auto_trader_state.json',
+          '**/.paper_trading_state.json',
+          '**/*.json',
+          '**/*.log',
+          '**/scratch/**',
+          '**/.system_generated/**',
+          '**/tests/**',
+          '**/public/**',
           '**/.whatsapp_session/**',
-          '**/public/whatsapp_sent_log.json',
-          '**/synced_leads.json'
+          '**/*.md',
+          '**/dist/**'
         ]
       },
     },

@@ -32,11 +32,37 @@ const DEFAULT_STATUS: AutoTraderStatus = {
   winningTradesToday: 0,
   losingTradesToday: 0,
   winRatePct: 0,
+  consecutiveLossCount: 0,
+  maxConsecutiveLossesAllowed: 3,
+  maxDailyLossCapUSD: 26.18,
+  maxDailyLossCapINR: 1200,
+  expectedValuePerTradeUSD: 0,
+  expectedValuePerTradeINR: 0,
+  requiredBreakoutMovePct: 5.2,
   cooldownRemainingMins: 0,
   circuitBreakerActive: false,
   fundingRateWarning: null,
   newsFreezeActive: false,
   lastAnalysisTimestamp: "",
+  currentInspection: {
+    assetIndex: 0,
+    symbol: "BTCUSD",
+    name: "Bitcoin",
+    tag: "BTC",
+    currentPrice: 0,
+    inspectionRemainingSeconds: 300,
+    inspectionTotalSeconds: 300,
+    status: "INSPECTING",
+    nextSymbol: "ETHUSD",
+    currentScore: 0,
+    currentDirection: "NEUTRAL",
+    currentEVUSD: 0,
+    buyEVUSD: 0,
+    sellEVUSD: 0,
+    buyScore: 0,
+    sellScore: 0,
+    twoHourHorizonSummary: "Analyzing 15m/1h/4h confluence..."
+  },
   batchCycle: {
     currentBatchTrades: 0,
     maxBatchTrades: 5,
@@ -48,16 +74,17 @@ const DEFAULT_STATUS: AutoTraderStatus = {
 };
 
 const DEFAULT_SETTINGS: AutoTraderSettings = {
-  mode: "LIVE",
-  isEnabled: true,
-  initialCapitalUSD: 195.80,
-  currentCapitalUSD: 195.80,
-  riskPerTradePct: 2.0,
-  maxDailyLossPct: 3.0,
+  mode: "PAPER",
+  isEnabled: false,
+  initialCapitalUSD: 523.50,
+  currentCapitalUSD: 523.50,
+  riskPerTradePct: 1.5,
+  maxDailyLossPct: 5.0,
   maxTradesPerDay: 10,
   maxConcurrentPositions: 5,
-  cooldownMinutesAfterLoss: 45,
-  minConfidenceThreshold: 55
+  cooldownMinutesAfterLoss: 60,
+  minConfidenceThreshold: 80,
+  inspectionWindowMinutes: 5
 };
 
 export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
@@ -126,6 +153,21 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
     fetchServerState();
     const serverPollInterval = setInterval(fetchServerState, 1500);
 
+    // ⏱️ Smooth 1-second client tick for fluid countdown display
+    const countdownTick = setInterval(() => {
+      setStatus(prev => {
+        if (!prev?.currentInspection?.inspectionRemainingSeconds) return prev;
+        const nextRem = Math.max(0, prev.currentInspection.inspectionRemainingSeconds - 1);
+        return {
+          ...prev,
+          currentInspection: {
+            ...prev.currentInspection,
+            inspectionRemainingSeconds: nextRem
+          }
+        };
+      });
+    }, 1000);
+
     // 📱 Screen WakeLock: Prevents mobile and laptop screen from sleeping while Auto-Trader is running
     let wakeLockSentinel: any = null;
     const requestWakeLock = async () => {
@@ -152,6 +194,7 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
 
     return () => {
       clearInterval(serverPollInterval);
+      clearInterval(countdownTick);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (wakeLockSentinel && typeof wakeLockSentinel.release === "function") {
         wakeLockSentinel.release().catch(() => {});
@@ -169,16 +212,12 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
           setDiagnostics(data.diagnostics);
         }
       } else {
-        const localDiag = await deltaAutoTraderEngine.getScanDiagnostics();
-        setDiagnostics(localDiag);
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       setShowRadarModal(true);
     } catch (e) {
-      try {
-        const localDiag = await deltaAutoTraderEngine.getScanDiagnostics();
-        setDiagnostics(localDiag);
-        setShowRadarModal(true);
-      } catch (err) {}
+      setNotification("Server unreachable — action not applied. Try again.");
+      setShowRadarModal(true);
     } finally {
       setIsScanning(false);
     }
@@ -197,9 +236,12 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
         const data = await res.json();
         setNotification(data?.message || `Executed trade on ${sym}`);
         setShowRadarModal(false);
+      } else {
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       await fetchServerState();
     } catch (e) {
+      setNotification("Server unreachable — action not applied. Try again.");
       await fetchServerState();
     } finally {
       setIsForcing(false);
@@ -221,9 +263,37 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
           setNotification(scanData?.message || "Scan complete: 5-minute reading active.");
         }
       } else {
+        setNotification("Server unreachable — action not applied. Try again.");
         await fetchServerState();
       }
     } catch (err) {
+      setNotification("Server unreachable — action not applied. Try again.");
+      await fetchServerState();
+    } finally {
+      setIsScanning(false);
+      setTimeout(() => setNotification(null), 5000);
+    }
+  };
+
+  const handleInstantDirectionTrade = async (direction: "BUY" | "SELL") => {
+    const sym = status.currentInspection?.symbol || "BTCUSD";
+    setIsScanning(true);
+    setNotification(`⚡ Executing Instant ${direction} on ${sym}...`);
+    try {
+      const res = await fetch("/api/autotrader/force", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: sym, forceDirection: direction })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setNotification(data?.message || `Executed ${direction} on ${sym}`);
+      } else {
+        setNotification("Server unreachable — action not applied. Try again.");
+      }
+      await fetchServerState();
+    } catch (e) {
+      setNotification("Server unreachable — action not applied. Try again.");
       await fetchServerState();
     } finally {
       setIsScanning(false);
@@ -238,13 +308,11 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
         const data = await res.json();
         setNotification(data?.message || "Skipped to next coin in queue.");
       } else {
-        const localRes = deltaAutoTraderEngine.skipCurrentAssetInspection();
-        setNotification(localRes.message);
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       fetchServerState();
     } catch (e) {
-      const localRes = deltaAutoTraderEngine.skipCurrentAssetInspection();
-      setNotification(localRes.message);
+      setNotification("Server unreachable — action not applied. Try again.");
       fetchServerState();
     }
     setTimeout(() => setNotification(null), 4000);
@@ -263,21 +331,14 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
         const data = await res.json();
         if (data?.state?.settings) setSettings(data.state.settings);
         if (data?.state?.status) setStatus(data.state.status);
+        setNotification(nextState ? "🟢 24/7 Auto-Trader ACTIVE! 5-Min inspection window started on Coin #1 (BTCUSD)." : "⏸️ Delta Auto-Trader PAUSED.");
       } else {
-        deltaAutoTraderEngine.toggleBot(nextState);
-        const local = deltaAutoTraderEngine.getLiveFullState();
-        setSettings(local.settings);
-        setStatus(local.status);
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       fetchServerState();
-      setNotification(nextState ? "🟢 24/7 Auto-Trader ACTIVE! 5-Min inspection window started on Coin #1 (BTCUSD)." : "⏸️ Delta Auto-Trader PAUSED.");
     } catch (e) {
-      deltaAutoTraderEngine.toggleBot(nextState);
-      const local = deltaAutoTraderEngine.getLiveFullState();
-      setSettings(local.settings);
-      setStatus(local.status);
+      setNotification("Server unreachable — action not applied. Try again.");
       fetchServerState();
-      setNotification(nextState ? "🟢 Auto-Trader ACTIVE! 5-Min inspection window running on Coin #1 (BTCUSD)." : "⏸️ Delta Auto-Trader PAUSED.");
     }
     setTimeout(() => setNotification(null), 4000);
   };
@@ -293,16 +354,14 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
       if (res.ok) {
         const data = await res.json();
         if (data?.state?.settings) setSettings(data.state.settings);
+        setNotification(`Switched mode to ${nextMode}`);
       } else {
-        deltaAutoTraderEngine.toggleMode(nextMode);
-        setSettings(deltaAutoTraderEngine.getSettings());
+        setNotification("Server unreachable — action not applied. Try again.");
       }
     } catch (e) {
-      deltaAutoTraderEngine.toggleMode(nextMode);
-      setSettings(deltaAutoTraderEngine.getSettings());
+      setNotification("Server unreachable — action not applied. Try again.");
     }
     fetchServerState();
-    setNotification(`Switched mode to ${nextMode}`);
     setTimeout(() => setNotification(null), 3000);
   };
 
@@ -316,10 +375,12 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
       const data = await res.json();
       if (data?.success && data.state?.settings) {
         setSettings(data.state.settings);
+      } else {
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       fetchServerState();
     } catch (e) {
-      console.warn("Update settings failed", e);
+      setNotification("Server unreachable — action not applied. Try again.");
     }
   };
 
@@ -328,24 +389,28 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
       const res = await fetch("/api/autotrader/reset", { method: "POST" });
       if (res.ok) {
         const data = await res.json();
+        if (data?.state) {
+          if (data.state.settings) setSettings(data.state.settings);
+          if (data.state.openPositions) setPositions(data.state.openPositions);
+          if (data.state.closedRecords) setRecords(data.state.closedRecords);
+          if (data.state.status) setStatus(data.state.status);
+        }
         setNotification(data?.message || "🧹 Trades reset successfully & Bot set to OFF.");
+      } else {
+        setNotification("Server unreachable — action not applied. Try again.");
       }
-    } catch (e) {}
+    } catch (e) {
+      setNotification("Server unreachable — action not applied. Try again.");
+    }
 
-    try {
-      deltaAutoTraderEngine.resetSystemCleanly();
-      const local = deltaAutoTraderEngine.getLiveFullState();
-      if (local) {
-        setSettings(local.settings);
-        setPositions(local.openPositions);
-        setRecords(local.closedRecords);
-        setStatus(local.status);
-      }
-      if (typeof window !== "undefined" && window.localStorage) {
+    if (typeof window !== "undefined" && window.localStorage) {
+      try {
+        window.localStorage.removeItem("NEXVORA_DELTA_AUTO_TRADER_STATE_V10");
         window.localStorage.removeItem("delta_autotrader_state_v3");
-      }
-      setNotification("🧹 Trades reset successfully & Bot set to OFF.");
-    } catch (err) {}
+        window.localStorage.removeItem("delta_autotrader_state_v2");
+        window.localStorage.clear();
+      } catch (e) {}
+    }
 
     fetchServerState();
     setTimeout(() => setNotification(null), 5000);
@@ -356,23 +421,20 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
       const res = await fetch("/api/autotrader/close-position", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ positionId, exitPrice: currentPrice, reason: "MANUAL_UI_CLOSE" })
+        body: JSON.stringify({ positionId, exitPrice: currentPrice, reason: "MANUAL_EXIT" })
       });
       if (res.ok) {
         const data = await res.json();
         setNotification(data?.message || "Position closed.");
       } else {
-        deltaAutoTraderEngine.closePosition(positionId, currentPrice, "MANUAL_UI_CLOSE");
-        setNotification("Position closed successfully.");
+        setNotification("Server unreachable — action not applied. Try again.");
       }
       fetchServerState();
-      setTimeout(() => setNotification(null), 4000);
     } catch (e) {
-      deltaAutoTraderEngine.closePosition(positionId, currentPrice, "MANUAL_UI_CLOSE");
+      setNotification("Server unreachable — action not applied. Try again.");
       fetchServerState();
-      setNotification("Position closed successfully.");
-      setTimeout(() => setNotification(null), 4000);
     }
+    setTimeout(() => setNotification(null), 4000);
   };
 
   const isProfit = status.todayPnLUSD >= 0;
@@ -582,8 +644,8 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
         </div>
       </div>
 
-      {/* 🔄 5-MINUTE DEDICATED ROUND-ROBIN ASSET READING & PROFIT QUEUE */}
-      <div className="p-5 rounded-2xl bg-gradient-to-r from-slate-950 via-indigo-950/70 to-slate-950 border border-indigo-500/50 shadow-2xl space-y-3 animate-fade-in">
+      {/* 🔄 5-MINUTE DEDICATED ROUND-ROBIN ASSET READING & 2-HOUR PROFIT HORIZON QUEUE */}
+      <div className="p-5 rounded-2xl bg-gradient-to-r from-slate-950 via-indigo-950/70 to-slate-950 border border-indigo-500/50 shadow-2xl space-y-4 animate-fade-in">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <span className="p-3 rounded-2xl bg-indigo-600/20 text-indigo-400 border border-indigo-500/30">
@@ -603,52 +665,96 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                   </span>
                 ) : (
                   <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40 animate-pulse">
-                    ⏳ 5-MIN READING WINDOW ({positions.length}/5 ACTIVE)
+                    ⏳ 5-MIN FULL ANALYSIS ({positions.length}/5 ACTIVE)
                   </span>
                 )}
               </div>
               <p className="text-[11px] text-slate-300 font-sans mt-1">
                 {positions.length >= (settings.maxConcurrentPositions || 5)
-                  ? `All 5/5 slots currently active (${positions.map(p => p.symbol).join(", ")}). Actively managing trailing stops & profit targets. Scanner will resume reading next coin as soon as any position exits.`
-                  : `Dedicated 5-minute analysis on ${status.currentInspection?.symbol || "BTCUSD"} specifically calculating the 2-Hour Trend Horizon for maximum profit. Anchors 4h/1h momentum to determine solid BUY/SELL bias, 1:2.2 R:R targets & protective SL.`}
+                  ? `All 5/5 slots currently active (${positions.map(p => p.symbol).join(", ")}). Tracking trailing stops & profit targets.`
+                  : `Full 5-minute continuous observation on ${status.currentInspection?.symbol || "BTCUSD"}. Compares 2-Hour Forward BUY vs SELL expected profits to strictly pick the higher profit outcome before auto-executing.`}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0 self-end md:self-auto">
+          <div className="flex items-center gap-2 shrink-0 self-end md:self-auto flex-wrap">
             {positions.length < (settings.maxConcurrentPositions || 5) && (
               <button
                 onClick={handleSkipInspection}
-                className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-bold transition flex items-center gap-1 cursor-pointer"
+                className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-bold transition flex items-center gap-1 cursor-pointer"
                 title="Skip this coin and start 5-min inspection on next coin in queue"
               >
-                ⏭️ Skip to Next ({status.currentInspection?.nextSymbol || "ETHUSD"})
+                ⏭️ Skip ({status.currentInspection?.nextSymbol || "Next"})
               </button>
             )}
             <button
               onClick={handleManualScan}
               disabled={isScanning}
-              className="px-3.5 py-2 rounded-xl bg-indigo-600/40 hover:bg-indigo-600/70 border border-indigo-500/50 text-indigo-100 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              className="px-3 py-1.5 rounded-xl bg-indigo-600/40 hover:bg-indigo-600/70 border border-indigo-500/50 text-indigo-100 text-xs font-bold transition flex items-center gap-1 cursor-pointer disabled:opacity-50"
             >
               <Zap className="w-3.5 h-3.5 text-amber-300" />
-              ⚡ Evaluate & Fire
+              ⚡ Instant Auto-Scan
             </button>
           </div>
         </div>
 
+        {/* 📊 2-HOUR BUY vs SELL EXPECTED PROFIT COMPARISON MATRIX */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-3 rounded-xl bg-slate-950/90 border border-indigo-900/60 font-mono text-xs">
+          {/* BUY HORIZON */}
+          <div className={`p-2.5 rounded-lg border transition ${status.currentInspection?.currentDirection === "BUY" ? "bg-emerald-950/40 border-emerald-500/50" : "bg-slate-900/40 border-slate-800/80 opacity-75"}`}>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px] font-bold text-emerald-400 flex items-center gap-1">
+                🟢 2-Hour BUY Model
+              </span>
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300">
+                Score: {status.currentInspection?.buyScore ?? "--"}%
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] text-slate-400 font-sans">Net Expected Profit:</span>
+              <strong className="text-emerald-300 text-sm">
+                {((status.currentInspection?.buyEVUSD ?? 0) >= 0 ? "+" : "")}${status.currentInspection?.buyEVUSD ? status.currentInspection.buyEVUSD.toFixed(2) : "0.00"} USD
+              </strong>
+            </div>
+            <span className="text-[9px] text-slate-500 font-sans block mt-0.5">
+              (₹{((status.currentInspection?.buyEVUSD ?? 0) * USD_TO_INR).toLocaleString(undefined, { maximumFractionDigits: 1 })} INR net taker fees)
+            </span>
+          </div>
+
+          {/* SELL HORIZON */}
+          <div className={`p-2.5 rounded-lg border transition ${status.currentInspection?.currentDirection === "SELL" ? "bg-rose-950/40 border-rose-500/50" : "bg-slate-900/40 border-slate-800/80 opacity-75"}`}>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px] font-bold text-rose-400 flex items-center gap-1">
+                🔴 2-Hour SELL Model
+              </span>
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300">
+                Score: {status.currentInspection?.sellScore ?? "--"}%
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] text-slate-400 font-sans">Net Expected Profit:</span>
+              <strong className="text-rose-300 text-sm">
+                {((status.currentInspection?.sellEVUSD ?? 0) >= 0 ? "+" : "")}${status.currentInspection?.sellEVUSD ? status.currentInspection.sellEVUSD.toFixed(2) : "0.00"} USD
+              </strong>
+            </div>
+            <span className="text-[9px] text-slate-500 font-sans block mt-0.5">
+              (₹{((status.currentInspection?.sellEVUSD ?? 0) * USD_TO_INR).toLocaleString(undefined, { maximumFractionDigits: 1 })} INR net taker fees)
+            </span>
+          </div>
+        </div>
+
         {/* 5-MINUTE COUNTDOWN & SIGNAL PROGRESS BAR */}
-        {positions.length < (settings.maxConcurrentPositions || 5) && settings.isEnabled && (
+        {settings.isEnabled && (
           <div className="pt-2 border-t border-indigo-950/80 space-y-1.5">
-            <div className="flex items-center justify-between text-xs font-mono text-slate-300">
+            <div className="flex items-center justify-between text-xs font-mono text-slate-300 flex-wrap gap-2">
               <span className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"></span>
-                Inspection Time Remaining: <strong className="text-amber-300">{Math.floor((status.currentInspection?.inspectionRemainingSeconds || 300) / 60)}m {((status.currentInspection?.inspectionRemainingSeconds || 300) % 60).toString().padStart(2, "0")}s</strong>
+                5-Min Analysis Timer: <strong className="text-amber-300">{Math.floor((status.currentInspection?.inspectionRemainingSeconds || 300) / 60)}m {((status.currentInspection?.inspectionRemainingSeconds || 300) % 60).toString().padStart(2, "0")}s remaining</strong>
               </span>
               <span className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap">
                 <span>Price: <strong className="text-white">${formatAssetPrice(status.currentInspection?.currentPrice || 0)} (₹{((status.currentInspection?.currentPrice || 0) * USD_TO_INR).toLocaleString(undefined, { maximumFractionDigits: 2 })} INR)</strong></span>
-                <span>· Bias: <strong className={status.currentInspection?.currentDirection === "BUY" ? "text-emerald-400" : status.currentInspection?.currentDirection === "SELL" ? "text-rose-400" : "text-slate-400"}>{status.currentInspection?.currentDirection || "ANALYZING"}</strong></span>
-                <span>· Score: <strong className="text-indigo-300">{status.currentInspection?.currentScore || "--"}/100</strong></span>
-                <span>· EV: <strong className="text-emerald-300">+${status.currentInspection?.currentEVUSD ? status.currentInspection.currentEVUSD.toFixed(2) : "0.00"}</strong></span>
+                <span>· Chosen Bias: <strong className={status.currentInspection?.currentDirection === "BUY" ? "text-emerald-400" : status.currentInspection?.currentDirection === "SELL" ? "text-rose-400" : "text-slate-400"}>{status.currentInspection?.currentDirection || "ANALYZING"}</strong></span>
+                <span>· Confluence Score: <strong className="text-indigo-300">{status.currentInspection?.currentScore || "--"}/100</strong></span>
               </span>
             </div>
             <div className="w-full h-2 rounded-full bg-slate-900 overflow-hidden border border-indigo-950">
@@ -777,7 +883,7 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                 {/* 1. TREND POV */}
                 <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-slate-400 font-bold uppercase">1. Trend POV (4-Hour):</span>
+                    <span className="text-[10px] text-slate-400 font-bold uppercase">1. Macro Trend (1-Hour):</span>
                     <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${
                       diagnostics?.bestAsset?.fourHourTrend === "BULLISH" ? "bg-emerald-500/20 text-emerald-300" :
                       diagnostics?.bestAsset?.fourHourTrend === "BEARISH" ? "bg-rose-500/20 text-rose-300" : "bg-slate-800 text-slate-400"
@@ -786,7 +892,7 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-200 font-sans">
-                    EMA 20/50/200 Stack · Bias: <strong className="text-amber-300">{status.currentInspection?.currentDirection || "NEUTRAL"}</strong>
+                    1h EMA 20/50 & LR Slope · Bias: <strong className="text-amber-300">{status.currentInspection?.currentDirection || "NEUTRAL"}</strong>
                   </div>
                 </div>
 
@@ -848,7 +954,7 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
           <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-bold text-slate-300 flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-emerald-400" /> Active Bot Open Position ({positions.length} / {settings.maxConcurrentPositions})
+                <ShieldCheck className="w-4 h-4 text-emerald-400" /> Active Bot Open Position ({positions.length} / {Math.max(5, settings.maxConcurrentPositions || 5)})
               </h3>
               <button
                 onClick={handleResetTrades}
@@ -867,27 +973,27 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
               <div className="space-y-3">
                 {positions.map(pos => (
                   <div key={pos.id} className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3 shadow-xl">
-                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                      <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                      <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                         <span className="font-bold text-white text-sm">{pos.symbol}</span>
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                           pos.type === "BUY" ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30" : "bg-rose-500/20 text-rose-300 border border-rose-500/30"
                         }`}>
-                          {pos.type === "BUY" ? "🟢 BUY (LONG)" : "🔴 SELL (SHORT)"}
+                          {pos.type === "BUY" ? "🟢 BUY" : "🔴 SELL"}
                         </span>
-                        <span className="text-[10px] text-indigo-300 px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/20">
-                          {pos.timeframeAlignment || "15m + 1h + 4h"}
+                        <span className="text-[9px] text-indigo-300 px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/20 truncate">
+                          {pos.timeframeAlignment ? pos.timeframeAlignment.replace(/1d Horizon|24h Horizon/g, "2h Max") : "2h Horizon"}
                         </span>
                       </div>
 
-                      <div className="flex items-center gap-2">
-                        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-950/60 border border-indigo-500/30 text-[10px] font-bold text-indigo-300">
-                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                          Auto-Managed R-Multiple Exit
+                      <div className="flex items-center gap-1.5 ml-auto">
+                        <div className="hidden xs:flex items-center gap-1 px-2 py-1 rounded-lg bg-indigo-950/60 border border-indigo-500/30 text-[9px] font-bold text-indigo-300">
+                          <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                          Auto-Exit
                         </div>
                         <button
                           onClick={() => handleClosePosition(pos.id, pos.currentPrice || pos.entryPrice)}
-                          className="px-2 py-1 rounded-lg bg-rose-950/80 hover:bg-rose-900 border border-rose-500/40 text-rose-300 text-[10px] font-bold transition cursor-pointer"
+                          className="px-2.5 py-1 rounded-lg bg-rose-950/80 hover:bg-rose-900 border border-rose-500/40 text-rose-300 text-[10px] font-bold transition cursor-pointer active:scale-95"
                         >
                           Manual Exit
                         </button>
@@ -908,7 +1014,13 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                         <span className="text-[9px] text-slate-500 block font-sans">₹{(pos.currentPrice * USD_TO_INR).toLocaleString(undefined, { maximumFractionDigits: 2 })} INR</span>
                       </div>
                       {(() => {
-                        const targetGainUSD = Math.abs(pos.targetPrice - pos.entryPrice) * pos.quantity;
+                        const posSym = pos.symbol.toUpperCase();
+                        const actualQty = (pos.quantity >= 1 && (posSym === 'BTCUSD' || posSym === 'BTCUSDT'))
+                          ? (pos.quantity * 0.001)
+                          : (pos.quantity >= 1 && (posSym === 'ETHUSD' || posSym === 'ETHUSDT'))
+                          ? (pos.quantity * 0.01)
+                          : pos.quantity;
+                        const targetGainUSD = Math.abs(pos.targetPrice - pos.entryPrice) * actualQty;
                         const targetGainINR = targetGainUSD * USD_TO_INR;
                         return (
                           <>
@@ -933,21 +1045,27 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                       })()}
                     </div>
 
-                    {/* ⏱️ FAST 30M - 75M INTRADAY BURST TIMER */}
+                    {/* ⏱️ 2-HOUR MAXIMUM HOLD TIMER */}
                     {(() => {
                       const entryMs = pos.entryTimeMs || new Date(pos.entryTimestamp).getTime() || (Date.now() - 60000);
                       const diffMins = Math.max(1, Math.floor((Date.now() - entryMs) / 60000));
                       const diffHours = Math.floor(diffMins / 60);
-                      const targetGainUSD = Math.abs(pos.targetPrice - pos.entryPrice) * pos.quantity;
+                      const posSym = pos.symbol.toUpperCase();
+                      const actualQty = (pos.quantity >= 1 && (posSym === 'BTCUSD' || posSym === 'BTCUSDT'))
+                        ? (pos.quantity * 0.001)
+                        : (pos.quantity >= 1 && (posSym === 'ETHUSD' || posSym === 'ETHUSDT'))
+                        ? (pos.quantity * 0.01)
+                        : pos.quantity;
+                      const targetGainUSD = Math.abs(pos.targetPrice - pos.entryPrice) * actualQty;
                       const targetGainINR = targetGainUSD * USD_TO_INR;
                       return (
                         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-950/80 border border-indigo-500/20 text-[11px] font-mono">
                           <span className="text-amber-300 flex items-center gap-1.5 font-bold">
                             <Clock className="w-3.5 h-3.5 text-amber-400" />
-                            Active Hold: {diffHours > 0 ? `${diffHours}h ${diffMins % 60}m` : `${diffMins}m`} · Swing Trend Horizon (2h – 24h)
+                            Detected Hold Horizon: 2h Max Hold · Elapsed: {diffHours > 0 ? `${diffHours}h ${diffMins % 60}m` : `${diffMins}m`} / 2h (120m)
                           </span>
                           <span className="text-emerald-400 font-bold bg-emerald-950/60 border border-emerald-500/30 px-2 py-0.5 rounded-lg">
-                            🎯 Potential Gain on Target Hit: +${targetGainUSD.toFixed(2)} USD (+₹{targetGainINR.toFixed(0)} INR)
+                            🎯 High Profit Target (+2.5R): +${targetGainUSD.toFixed(2)} USD (+₹{targetGainINR.toFixed(0)} INR)
                           </span>
                         </div>
                       );
@@ -1065,11 +1183,10 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             {CURATED_AUTO_TRADER_ASSETS.map((ast, idx) => {
               const liveP = brokerTickEngine.getLivePrice(ast.symbol) || ast.baselinePrice;
-              const approxSLDist = Math.max(liveP * 0.015, 0.05);
-              const riskBudgetUSD = settings.currentCapitalUSD * (settings.riskPerTradePct / 100);
-              const rawQty = approxSLDist > 0 ? riskBudgetUSD / approxSLDist : ast.minLot;
-              const quantity = Math.max(ast.minLot, Number(rawQty.toFixed(ast.decimals)));
-              const initialRiskUSD = Number((approxSLDist * quantity).toFixed(2));
+              const approxSLDist = Math.max(liveP * 0.0065, 0.05);
+              const lotInfo = deltaAutoTraderEngine.calculateDynamicLotSize(ast.symbol, liveP, approxSLDist);
+              const quantity = lotInfo.quantity;
+              const initialRiskUSD = lotInfo.initialRiskUSD;
               const isCurrent = (ticker || "").toUpperCase().includes(ast.tag);
 
               return (
@@ -1502,7 +1619,7 @@ export const DeltaAutoTraderCard: React.FC<DeltaAutoTraderCardProps> = ({
                       </div>
 
                       <div className="text-[10px] text-slate-400 flex items-center gap-2">
-                        <span>4h: <strong className="text-slate-200">{asset.fourHourTrend}</strong></span>
+                        <span>Trend: <strong className="text-slate-200">{asset.fourHourTrend}</strong></span>
                         <span>1h: <strong className="text-slate-200">{asset.oneHourMomentum}</strong></span>
                         <span>15m: <strong className="text-slate-200">{asset.fifteenMinTrigger}</strong></span>
                       </div>

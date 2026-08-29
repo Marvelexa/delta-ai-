@@ -559,6 +559,25 @@ class DeltaExchangeEngine {
     return rounded.toFixed(decimals);
   }
 
+  public async fetchOpenOrders(productId?: number): Promise<any[]> {
+    const key = this.getApiKey();
+    const secret = this.getApiSecret();
+    if (!key || !secret) return [];
+    try {
+      const path = productId ? `/v2/orders?state=open&product_id=${productId}` : `/v2/orders?state=open`;
+      const headers = this.getAuthHeaders("GET", path, "");
+      const res = await fetch(`https://api.india.delta.exchange${path}`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json", ...headers }
+      });
+      const data = await res.json();
+      return (data && data.success && Array.isArray(data.result)) ? data.result : [];
+    } catch (err) {
+      console.error("[DeltaExchange] Error fetching open orders:", err);
+      return [];
+    }
+  }
+
   public async placeOrder(
     symbol: string,
     side: "buy" | "sell",
@@ -584,12 +603,12 @@ class DeltaExchangeEngine {
         || this.products.get(`${cleanTag}USDT`)
         || Array.from(this.products.values()).find(p => p.symbol?.toUpperCase() === symUpper || p.symbol?.toUpperCase() === `${cleanTag}USD` || p.symbol?.toUpperCase() === `${cleanTag}USDT`);
 
-      const productId = product ? product.id : 27;
+      if (!product) {
+        throw new Error(`Product not loaded for ${symbol}. Call fetchProducts() first.`);
+      }
+      const productId = product.id;
       const tickSize = (product as any)?.tick_size || "0.01";
-      const contractVal = parseFloat((product as any)?.contract_value || "1") || 1;
-      const contractsSize = contractVal < 1
-        ? Math.max(1, Math.round(size / contractVal))
-        : Math.max(1, Math.round(size));
+      const contractsSize = Math.max(1, Math.round(size));
 
       const path = "/v2/orders";
       const bodyData: any = {
@@ -623,6 +642,16 @@ class DeltaExchangeEngine {
       const data = await response.json();
       if (data && data.error) {
         console.error(`[DeltaExchange] ❌ DELTA EXCHANGE ORDER REJECTED:`, JSON.stringify(data.error));
+        // Learn margin mode from rejection context
+        if (data.error?.code === "trading_not_allowed_on_current_margin_mode" && data.error?.context) {
+          const ctx = data.error.context;
+          if (ctx.current_margin_mode) this.cachedMarginMode = ctx.current_margin_mode;
+          if (ctx.enabled_pf_asset_symbols && Array.isArray(ctx.enabled_pf_asset_symbols)) {
+            this.cachedEnabledAssets = ctx.enabled_pf_asset_symbols;
+            this.marginModeCheckedAt = Date.now();
+            console.log(`[DeltaExchange] 📊 Learned Margin Mode from rejection: ${this.cachedMarginMode}, Enabled: [${this.cachedEnabledAssets.join(", ")}]`);
+          }
+        }
       } else {
         console.log(`[DeltaExchange] 🚀 Live Order Placed on Delta Exchange: ${side} ${contractsSize} contracts (${size} ${symbol}) [SL: ${stopLossPrice || "None"}, TP: ${takeProfitPrice || "None"}]`, data);
       }
@@ -654,7 +683,10 @@ class DeltaExchangeEngine {
         || this.products.get(`${cleanTag}USDT`)
         || Array.from(this.products.values()).find(p => p.symbol?.toUpperCase() === symUpper || p.symbol?.toUpperCase() === `${cleanTag}USD` || p.symbol?.toUpperCase() === `${cleanTag}USDT`);
 
-      const productId = product ? product.id : 27;
+      if (!product) {
+        throw new Error(`Product not loaded for ${symbol}. Call fetchProducts() first.`);
+      }
+      const productId = product.id;
       const tickSize = (product as any)?.tick_size || "0.01";
       const path = "/v2/orders/bracket";
       const bodyData: any = {
@@ -717,42 +749,79 @@ class DeltaExchangeEngine {
         || this.products.get(`${cleanTag}USDT`)
         || Array.from(this.products.values()).find(p => p.symbol?.toUpperCase() === symUpper || p.symbol?.toUpperCase() === `${cleanTag}USD` || p.symbol?.toUpperCase() === `${cleanTag}USDT`);
 
-      const productId = product ? product.id : 27;
+      if (!product) {
+        throw new Error(`Product not loaded for ${symbol}. Call fetchProducts() first.`);
+      }
+      const productId = product.id;
       const tickSize = (product as any)?.tick_size || "0.01";
-      const path = "/v2/orders/bracket";
-      const bodyData: any = {
-        product_id: productId,
-        product_symbol: product?.symbol || symUpper,
-        bracket_stop_trigger_method: "last_traded_price"
-      };
 
-      if (stopLossPrice && !isNaN(stopLossPrice) && stopLossPrice > 0) {
-        bodyData.stop_loss_order = {
-          order_type: "market_order",
-          stop_price: this.roundToTickSize(stopLossPrice, tickSize)
-        };
-      }
-      if (takeProfitPrice && !isNaN(takeProfitPrice) && takeProfitPrice > 0) {
-        bodyData.take_profit_order = {
-          order_type: "market_order",
-          stop_price: this.roundToTickSize(takeProfitPrice, tickSize)
-        };
-      }
-
-      const bodyStr = JSON.stringify(bodyData);
-      const headers = this.getAuthHeaders("PUT", path, "", bodyStr);
-
-      const response = await fetch(`https://api.india.delta.exchange${path}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...headers
-        },
-        body: bodyStr
+      // 1. Fetch current open conditional / bracket orders from Delta Exchange
+      const listPath = `/v2/orders?state=open&product_id=${productId}`;
+      const listHeaders = this.getAuthHeaders("GET", listPath, "");
+      const listRes = await fetch(`https://api.india.delta.exchange${listPath}`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json", ...listHeaders }
       });
-      const data = await response.json();
-      console.log(`[DeltaExchange] 🔄 Native Bracket Order modified via Modify API (PUT /v2/orders/bracket) on ${symbol}: SL=$${stopLossPrice}, TP=$${takeProfitPrice}`, data);
-      return data;
+      const listData = await listRes.json();
+      const openOrders: any[] = (listData && listData.success && Array.isArray(listData.result)) ? listData.result : [];
+
+      let slUpdated = false;
+      let tpUpdated = false;
+
+      // 2. Modify active Stop Loss Order if price changed
+      if (stopLossPrice && !isNaN(stopLossPrice) && stopLossPrice > 0) {
+        const slOrder = openOrders.find(o => o.stop_order_type === "stop_loss_order");
+        if (slOrder && slOrder.id) {
+          const modPath = "/v2/orders";
+          const modBody = JSON.stringify({
+            id: slOrder.id,
+            product_id: productId,
+            stop_price: this.roundToTickSize(stopLossPrice, tickSize)
+          });
+          const modHeaders = this.getAuthHeaders("PUT", modPath, "", modBody);
+          const modRes = await fetch(`https://api.india.delta.exchange${modPath}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", ...modHeaders },
+            body: modBody
+          });
+          const modData = await modRes.json();
+          if (modData.success) {
+            console.log(`[DeltaExchange] 🎯 LIVE EXCHANGE STOP-LOSS MODIFIED: ${symbol} SL updated to $${stopLossPrice} on Delta Exchange! (Order ID: ${slOrder.id})`);
+            slUpdated = true;
+          }
+        }
+      }
+
+      // 3. Modify active Take Profit Order if price changed
+      if (takeProfitPrice && !isNaN(takeProfitPrice) && takeProfitPrice > 0) {
+        const tpOrder = openOrders.find(o => o.stop_order_type === "take_profit_order");
+        if (tpOrder && tpOrder.id) {
+          const modPath = "/v2/orders";
+          const modBody = JSON.stringify({
+            id: tpOrder.id,
+            product_id: productId,
+            stop_price: this.roundToTickSize(takeProfitPrice, tickSize)
+          });
+          const modHeaders = this.getAuthHeaders("PUT", modPath, "", modBody);
+          const modRes = await fetch(`https://api.india.delta.exchange${modPath}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", ...modHeaders },
+            body: modBody
+          });
+          const modData = await modRes.json();
+          if (modData.success) {
+            console.log(`[DeltaExchange] 🎯 LIVE EXCHANGE TAKE-PROFIT MODIFIED: ${symbol} TP updated to $${takeProfitPrice} on Delta Exchange! (Order ID: ${tpOrder.id})`);
+            tpUpdated = true;
+          }
+        }
+      }
+
+      // 4. Fallback if no open bracket orders existed yet
+      if (!slUpdated && !tpUpdated && openOrders.length === 0) {
+        return await this.setBracketOrder(symbol, stopLossPrice, takeProfitPrice);
+      }
+
+      return { success: true, slUpdated, tpUpdated };
     } catch (err) {
       console.error("[DeltaExchange] Bracket order update error:", err);
       return { success: false, error: err };
@@ -776,7 +845,10 @@ class DeltaExchangeEngine {
         || this.products.get(`${cleanTag}USDT`)
         || Array.from(this.products.values()).find(p => p.symbol?.toUpperCase() === symUpper || p.symbol?.toUpperCase() === `${cleanTag}USD` || p.symbol?.toUpperCase() === `${cleanTag}USDT`);
 
-      const productId = product ? product.id : 27;
+      if (!product) {
+        throw new Error(`Product not loaded for ${symbol}. Call fetchProducts() first.`);
+      }
+      const productId = product.id;
       const path = "/v2/orders/bracket";
       const bodyData: any = {
         product_id: productId
@@ -883,12 +955,135 @@ class DeltaExchangeEngine {
     console.log("[DeltaExchange] ✅ Delta Exchange Engine initialized!");
   }
 
-  public getAccountSummary(): { netEquityUSD: number; availableBalanceUSD: number; isLive: boolean } {
-    return {
-      netEquityUSD: 191.25,
-      availableBalanceUSD: 191.25,
-      isLive: Boolean(this.apiKey && this.apiKey.length > 5)
-    };
+  public async getAccountSummary(): Promise<{ netEquityUSD: number; availableBalanceUSD: number; isLive: boolean }> {
+    try {
+      const balances = await this.fetchWalletBalance();
+      const equity = balances?.meta?.net_equity ? parseFloat(balances.meta.net_equity) : 0;
+      if (equity > 0) {
+        return { netEquityUSD: equity, availableBalanceUSD: equity, isLive: Boolean(this.apiKey && this.apiKey.length > 5) };
+      }
+    } catch (e) {
+      console.warn("[DeltaExchange] getAccountSummary fetch failed:", e);
+    }
+    return { netEquityUSD: 0, availableBalanceUSD: 0, isLive: Boolean(this.apiKey && this.apiKey.length > 5) };
+  }
+
+  // ────────────────────────────────────────────
+  // MARGIN MODE MANAGEMENT
+  // ────────────────────────────────────────────
+  private cachedMarginMode: string = "";
+  private cachedEnabledAssets: string[] = [];
+  private marginModeCheckedAt: number = 0;
+
+  /**
+   * Fetch current margin mode from Delta Exchange.
+   * Returns { margin_mode: "portfolio"|"isolated", enabled_pf_asset_symbols: string[] }
+   */
+  public async getMarginMode(): Promise<{ margin_mode: string; enabled_pf_asset_symbols: string[] }> {
+    // Cache for 5 minutes to avoid spamming
+    if (this.cachedMarginMode && this.cachedEnabledAssets.length > 0 && (Date.now() - this.marginModeCheckedAt < 300_000)) {
+      return { margin_mode: this.cachedMarginMode, enabled_pf_asset_symbols: this.cachedEnabledAssets };
+    }
+    const key = this.getApiKey();
+    const secret = this.getApiSecret();
+    if (!key || !secret) {
+      return { margin_mode: "isolated", enabled_pf_asset_symbols: [] };
+    }
+    try {
+      // Try /v2/profile first
+      const path = "/v2/profile";
+      const headers = this.getAuthHeaders("GET", path, "");
+      const res = await fetch(`https://api.india.delta.exchange${path}`, {
+        method: "GET",
+        headers
+      });
+      const data = await res.json();
+      const profile = data?.result || data;
+      const mode = profile?.margin_mode || "";
+      const enabledAssets: string[] = profile?.enabled_pf_asset_symbols || profile?.pf_enabled_assets || [];
+      
+      if (mode) {
+        this.cachedMarginMode = mode;
+        if (enabledAssets.length > 0) {
+          this.cachedEnabledAssets = enabledAssets;
+        }
+        this.marginModeCheckedAt = Date.now();
+        console.log(`[DeltaExchange] 📊 Margin Mode: ${mode}, Enabled Assets: [${this.cachedEnabledAssets.join(", ")}]`);
+      }
+      
+      // If we know it's portfolio mode but don't know which assets, 
+      // default to BTC+ETH (the most common portfolio margin pair on Delta Exchange India)
+      if (this.cachedMarginMode === "portfolio" && this.cachedEnabledAssets.length === 0) {
+        this.cachedEnabledAssets = ["BTC", "ETH"];
+        console.log(`[DeltaExchange] ⚠️ Portfolio mode detected, defaulting enabled assets to: [BTC, ETH]`);
+      }
+      
+      return { margin_mode: this.cachedMarginMode || "isolated", enabled_pf_asset_symbols: this.cachedEnabledAssets };
+    } catch (e) {
+      console.error("[DeltaExchange] Error fetching margin mode:", e);
+      return { margin_mode: this.cachedMarginMode || "isolated", enabled_pf_asset_symbols: this.cachedEnabledAssets };
+    }
+  }
+
+  /**
+   * Change margin mode to "isolated" or "portfolio".
+   * REQUIRES: No open positions or pending orders on the account.
+   */
+  public async changeMarginMode(newMode: "isolated" | "portfolio"): Promise<{ success: boolean; message: string }> {
+    const key = this.getApiKey();
+    const secret = this.getApiSecret();
+    if (!key || !secret) {
+      return { success: false, message: "API credentials missing." };
+    }
+    try {
+      const path = "/v2/users/margin_mode";
+      const bodyData = { margin_mode: newMode };
+      const bodyStr = JSON.stringify(bodyData);
+      const headers = this.getAuthHeaders("PUT", path, "", bodyStr);
+      const res = await fetch(`https://api.india.delta.exchange${path}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: bodyStr
+      });
+      const data = await res.json();
+      if (data?.error) {
+        console.error(`[DeltaExchange] ❌ Margin mode change failed:`, JSON.stringify(data.error));
+        return { success: false, message: JSON.stringify(data.error) };
+      }
+      this.cachedMarginMode = newMode;
+      this.marginModeCheckedAt = Date.now();
+      console.log(`[DeltaExchange] ✅ Margin mode changed to: ${newMode}`);
+      return { success: true, message: `Margin mode changed to ${newMode}` };
+    } catch (e) {
+      console.error("[DeltaExchange] Margin mode change error:", e);
+      return { success: false, message: String(e) };
+    }
+  }
+
+  /**
+   * Check if a specific coin symbol is tradeable under the current margin mode.
+   * In portfolio mode, only enabled_pf_asset_symbols can trade.
+   * In isolated mode, all coins can trade.
+   */
+  public isAssetTradeable(symbol: string): boolean {
+    const coinTag = symbol.toUpperCase().replace("USDT", "").replace("USD", "").replace("-", "").trim();
+    if (this.cachedMarginMode === "portfolio") {
+      return this.cachedEnabledAssets.some(a => a.toUpperCase() === coinTag);
+    }
+    return true; // Isolated mode allows all
+  }
+
+  /**
+   * Get the list of tradeable asset symbols (e.g. ["BTCUSD", "ETHUSD"]) based on current margin mode.
+   */
+  public getTradeableSymbols(allSymbols: string[]): string[] {
+    if (this.cachedMarginMode !== "portfolio" || this.cachedEnabledAssets.length === 0) {
+      return allSymbols; // isolated mode = all tradeable
+    }
+    return allSymbols.filter(sym => {
+      const tag = sym.toUpperCase().replace("USDT", "").replace("USD", "").replace("-", "").trim();
+      return this.cachedEnabledAssets.some(a => a.toUpperCase() === tag);
+    });
   }
 
   public disconnectWebSocket(): void {

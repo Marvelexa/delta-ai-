@@ -15,12 +15,16 @@ public/screenshots/
 
 # Session, Credential & State Files
 .angelone_session.json
+.angel_one_session.json
+.auth_config.json
 .delta_auto_trader_state.json
 .delta_session.json
 .paper_trading_state.json
 .trade_outcomes_state.json
 *.session.json
 *_state.json
+.*_state.json
+.*_session.json
 firebase-applet-config.json
 .scrip_master.json
 

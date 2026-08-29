@@ -412,7 +412,7 @@ async function generateContentWithFallback(
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3002;
   let outreachQueue = Promise.resolve();
 
   app.use(express.json());
@@ -618,9 +618,9 @@ async function startServer() {
   // Real-Time Server State (Runs 24/7 in Cloud even when Chrome is closed / Mobile is sleeping)
   app.get("/api/autotrader/state", async (req, res) => {
     try {
-      if (deltaAutoTraderEngine.getLiveFullState().settings.mode === "LIVE") {
-        await deltaAutoTraderEngine.syncWithExchangePositions();
-      }
+      // NOTE: syncWithExchangePositions is NOT called here to prevent the
+      // infinite sync→close→re-sync loop when frontend polls every 1.5s.
+      // Sync happens independently via the 30s daemon interval below.
       const fullState = deltaAutoTraderEngine.getLiveFullState();
       return res.json({ success: true, state: fullState });
     } catch (e: any) {
@@ -633,7 +633,8 @@ async function startServer() {
       const state = req.body;
       if (state) {
         fs.writeFileSync(DELTA_STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
-        return res.json({ success: true });
+        deltaAutoTraderEngine.applyParsedState(state);
+        return res.json({ success: true, state: deltaAutoTraderEngine.getLiveFullState() });
       }
       res.status(400).json({ success: false, error: "Empty payload" });
     } catch (e: any) {
@@ -655,18 +656,18 @@ async function startServer() {
     }
   });
 
-  app.post("/api/autotrader/reset", (req, res) => {
+  app.post("/api/autotrader/reset-queue", (req, res) => {
     try {
-      const result = deltaAutoTraderEngine.resetSystemCleanly();
-      return res.json({ success: true, message: result.message, state: deltaAutoTraderEngine.getLiveFullState() });
+      deltaAutoTraderEngine.resetToFirstAsset();
+      return res.json({ success: true, message: "Reset to Asset #1: BTC (Bitcoin) for 5-minute analysis.", state: deltaAutoTraderEngine.getLiveFullState() });
     } catch (e: any) {
       res.status(500).json({ success: false, error: e.message });
     }
   });
 
-  app.post("/api/autotrader/close-all", (req, res) => {
+  app.post("/api/autotrader/close-all", async (req, res) => {
     try {
-      const result = deltaAutoTraderEngine.closeAllOpenPositions("MANUAL_PANIC_CLOSE");
+      const result = await deltaAutoTraderEngine.closeAllOpenPositions("MANUAL_EXIT");
       return res.json({ success: true, count: result.count, message: result.message, state: deltaAutoTraderEngine.getLiveFullState() });
     } catch (e: any) {
       res.status(500).json({ success: false, error: e.message });
@@ -693,9 +694,32 @@ async function startServer() {
 
   app.post("/api/autotrader/force", async (req, res) => {
     try {
-      const { symbol } = req.body;
-      const result = await deltaAutoTraderEngine.forceExecuteTrade(symbol);
+      const forceDirection = req.body?.direction || req.body?.forceDirection;
+      const specificSymbol = req.body?.symbol;
+      const result = await deltaAutoTraderEngine.scanAndExecuteNextTrade(true, forceDirection, specificSymbol);
       return res.json({ ...result, state: deltaAutoTraderEngine.getLiveFullState() });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  app.post("/api/autotrader/scan", async (req, res) => {
+    try {
+      const result = await deltaAutoTraderEngine.scanAndExecuteNextTrade(false);
+      return res.json({ ...result, state: deltaAutoTraderEngine.getLiveFullState() });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  app.post("/api/autotrader/reset", (req, res) => {
+    try {
+      deltaAutoTraderEngine.resetSystemCleanly();
+      const fullState = deltaAutoTraderEngine.getLiveFullState();
+      try {
+        fs.writeFileSync(DELTA_STATE_FILE, JSON.stringify(fullState, null, 2), "utf-8");
+      } catch (e) {}
+      return res.json({ success: true, message: "🧹 System reset successfully.", state: fullState });
     } catch (e: any) {
       res.status(500).json({ success: false, error: e.message });
     }
@@ -705,6 +729,9 @@ async function startServer() {
     try {
       const newSettings = req.body;
       if (newSettings) {
+        if (newSettings.mode) {
+          deltaAutoTraderEngine.toggleMode(newSettings.mode);
+        }
         deltaAutoTraderEngine.updateSettings(newSettings);
         return res.json({ success: true, state: deltaAutoTraderEngine.getLiveFullState() });
       }
@@ -714,19 +741,11 @@ async function startServer() {
     }
   });
 
-  app.post("/api/autotrader/close-position", (req, res) => {
+  app.post(["/api/autotrader/close", "/api/autotrader/close-position"], async (req, res) => {
     try {
-      const { positionId, exitPrice, reason } = req.body;
-      const result = deltaAutoTraderEngine.closePosition(positionId, exitPrice, reason || "MANUAL_UI_CLOSE");
-      return res.json({ ...result, state: deltaAutoTraderEngine.getLiveFullState() });
-    } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
-    }
-  });
-
-  app.post("/api/autotrader/scan", async (req, res) => {
-    try {
-      const result = await deltaAutoTraderEngine.scanAndExecuteNextTrade(true);
+      const { positionId, exitPrice, currentPrice, reason } = req.body;
+      const price = exitPrice || currentPrice;
+      const result = await deltaAutoTraderEngine.closePosition(positionId, price, reason || "MANUAL_EXIT");
       return res.json({ ...result, state: deltaAutoTraderEngine.getLiveFullState() });
     } catch (e: any) {
       res.status(500).json({ success: false, error: e.message });
@@ -759,6 +778,15 @@ async function startServer() {
   // ============================================================================
   let isExitMonitoringLocked = false;
   let isEntryScanLocked = false;
+
+  // 🔄 Independent Position Sync Daemon (every 30s — safe, rate-limited, NOT on frontend hot path)
+  setInterval(async () => {
+    try {
+      if (deltaAutoTraderEngine.getLiveFullState().settings.mode === "LIVE") {
+        await deltaAutoTraderEngine.syncWithExchangePositions();
+      }
+    } catch (e) {}
+  }, 30000);
 
   // ⚡ 0. High-Frequency Real-Time Market Ticker Stream & Live P&L Updater (every 2.5s)
   try {
@@ -829,7 +857,7 @@ async function startServer() {
     isEntryScanLocked = true;
     try {
       const fullState = deltaAutoTraderEngine.getLiveFullState();
-      if (fullState.settings.isEnabled && fullState.openPositions.length < fullState.settings.maxConcurrentPositions) {
+      if (fullState.settings.isEnabled) {
         const res = await deltaAutoTraderEngine.scanAndExecuteNextTrade();
         if (res && res.executed) {
           console.log(`[DeltaDaemon] 🚀 AUTONOMOUS TRADE PLACED: ${res.message}`);
@@ -2951,7 +2979,24 @@ const safeMoveVideo = async (src: string, dest: string, retries = 5, delay = 500
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        watch: {
+          ignored: [
+            '**/.delta_auto_trader_state.json',
+            '**/.paper_trading_state.json',
+            '**/*.json',
+            '**/*.log',
+            '**/scratch/**',
+            '**/.system_generated/**',
+            '**/tests/**',
+            '**/public/**',
+            '**/.whatsapp_session/**',
+            '**/*.md',
+            '**/dist/**'
+          ]
+        }
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -2964,7 +3009,7 @@ const safeMoveVideo = async (src: string, dest: string, retries = 5, delay = 500
     });
   }
 
-  const portNumber = Number(process.env.PORT) || 3001;
+  const portNumber = Number(process.env.PORT) || PORT || 3002;
   const server = app.listen(portNumber, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${portNumber}`);
   });
